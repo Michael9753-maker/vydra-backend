@@ -4,4 +4,4 @@ yt-dlp
 requests
 pillow
 gunicorn
-supabase==3.7.0
+supabase==2.23.2
