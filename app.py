@@ -18,6 +18,7 @@ Notes:
  - Soft protective measures (cleanup, file size limits) remain to protect server resources.
 """
 
+# ---------- START: Render-ready top of app.py ----------
 import os
 import json
 import time
@@ -38,44 +39,81 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_file, redirect, make_response, Response, stream_with_context
 from flask_cors import CORS
 import logging
-from dotenv import load_dotenv
 from typing import Optional, Dict, Any
-import sqlite3 as sqlite3  # use plain sqlite3 (avoid detect_types auto-conversion pitfalls)
+import sqlite3  # use plain sqlite3 (avoid detect_types auto-conversion pitfalls)
 
-# load env
-load_dotenv()
-
+# Third-party clients
 from supabase import create_client, Client
+import openai
 
-SUPABASE_URL = "https://mlxxkzseymotmxbqmucz.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1seHhrenNleW1vdG14YnFtdWN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTIzMzczNTAsImV4cCI6MjA2NzkxMzM1MH0.SegD-LiI1Y9LuX3wKDL1SrJQnR9mz_kpMNsVeBcE2-Q"
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ---------------- Config & Constants ----------------
+# -------- Base directory (used for DB path, file storage, etc.) --------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-PORT = int(os.environ.get("VYDRA_PORT", 5000))
-# cleanup thresholds
-CLEANUP_SECONDS = int(os.environ.get("VYDRA_CLEANUP_SECONDS", 1800))  # legacy worker expiry (unused for history TTL below)
-HISTORY_MAX = int(os.environ.get("VYDRA_HISTORY_MAX", 200))
-MAX_RECENT_DOWNLOADS = int(os.environ.get("VYDRA_MAX_RECENT_DOWNLOADS", 5))  # per-user file keep
-HISTORY_FILE_TTL_SECS = int(os.environ.get("VYDRA_HISTORY_FILE_TTL_SECS", 3 * 3600))  # 3 hours default
+# -------- Logging setup --------
+log = logging.getLogger("vydra-backend")
+if not log.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+# -------- Flask app --------
+app = Flask(__name__)
+CORS(app)
+
+# -------- Environment variables (Render provides these) --------
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+PAYSTACK_SECRET = os.environ.get("PAYSTACK_SECRET")  # keep this name consistent
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+# Helpful debugging message if anything is missing (fail fast so Render logs show the issue)
+missing = [name for name, val in (
+    ("SUPABASE_URL", SUPABASE_URL),
+    ("SUPABASE_KEY", SUPABASE_KEY),
+    ("PAYSTACK_SECRET", PAYSTACK_SECRET),
+    ("OPENAI_API_KEY", OPENAI_API_KEY),
+) if not val]
+
+if missing:
+    # This will cause Render to surface a clear error in the deploy logs
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+# -------- Initialize external clients --------
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    log.info("Supabase client initialized.")
+except Exception:
+    log.exception("Failed to initialize Supabase client.")
+    raise
+
+# OpenAI setup
+openai.api_key = OPENAI_API_KEY
+log.info("OpenAI client configured.")
+
+# -------- PORT setup (Render sets PORT; default for local = 8000) --------
+PORT = int(os.environ.get("PORT", 8000))
+
+# ---------- END: Render-ready top of app.py ----------
+
+# ------------- Application config and thresholds -------------
+CLEANUP_SECONDS = int(os.environ.get("CLEANUP_SECONDS", 1800))  # legacy worker expiry (unused for history TTL below)
+HISTORY_MAX = int(os.environ.get("HISTORY_MAX", 200))
+MAX_RECENT_DOWNLOADS = int(os.environ.get("MAX_RECENT_DOWNLOADS", 5))  # per-user file keep
+HISTORY_FILE_TTL_SECS = int(os.environ.get("HISTORY_FILE_TTL_SECS", 3 * 3600))  # 3 hours default
 CLEANUP_INTERVAL_SECS = int(os.environ.get("VYDRA_CLEANUP_INTERVAL_SECS", 300))  # default 5 minutes
 ADMIN_TOKEN = os.environ.get("VYDRA_ADMIN_TOKEN", "")
 
 MAX_DURATION_SECONDS = int(os.environ.get("VYDRA_MAX_DURATION_SECONDS", 20 * 60))
 MAX_FILESIZE_BYTES = int(os.environ.get("VYDRA_MAX_FILESIZE_BYTES", 300 * 1024 * 1024))
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
+# Use DB_PATH inside repo by default
+DB_PATH = os.path.join(BASE_DIR, "vydra_referrals.db")
+# Ensure directory exists (will create if missing)
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
 WA_LINK = os.environ.get("WA_LINK", "https://wa.link/rcptsq")
 
-DB_PATH = os.path.join(BASE_DIR, "vydra_referrals.db")
+# Frontend origins — keep string for env var, but also provide parsed list for CORS checks
 FRONTEND_ORIGINS = os.environ.get("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+FRONTEND_ORIGINS_LIST = [o.strip() for o in FRONTEND_ORIGINS.split(",") if o.strip()]
 
 # Alerting address (locked as requested)
 ALERT_EMAIL_TO = os.environ.get("VYDRA_ALERT_EMAIL", "vydra.contact@gmail.com")
@@ -2015,7 +2053,9 @@ signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 atexit.register(_shutdown_manager)
 
-# ---------------- Server starter ----------------
+# ---------- START: Render-ready bottom of app.py ----------
 if __name__ == "__main__":
-    log.info("Starting VYDRA backend on 0.0.0.0:%s", PORT)
+    log.info("Starting VYDRA backend (local/dev) on 0.0.0.0:%s", PORT)
+    # debug=False to mimic production. Set to True while actively developing.
     app.run(host="0.0.0.0", port=PORT, debug=False)
+# ---------- END: Render-ready bottom of app.py ----------
