@@ -1,0 +1,6 @@
+Flask
+flask_cors
+yt-dlp
+requests
+pillow
+python-dotenv

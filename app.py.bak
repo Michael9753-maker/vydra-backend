@@ -1,0 +1,297 @@
+# app.py - VYDRA backend (full upgraded + fixed version)
+
+# Requirements:
+#   pip install flask flask_cors yt-dlp
+#   Ensure ffmpeg is installed and on PATH.
+
+import os
+import time
+import uuid
+import threading
+import traceback
+from datetime import datetime
+from collections import deque
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+import yt_dlp
+
+app = Flask(__name__)
+
+# Allow both localhost and 127.0.0.1
+CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}})
+
+# ---------------- CONFIG ----------------
+BASE_DIR = os.path.dirname(__file__)
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+PORT = int(os.environ.get("VYDRA_PORT", 5000))
+CLEANUP_SECONDS = int(os.environ.get("VYDRA_CLEANUP_SECONDS", 300))  # default 5 minutes
+HISTORY_MAX = int(os.environ.get("VYDRA_HISTORY_MAX", 200))
+MAX_RECENT_DOWNLOADS = 5  # keep only 5 latest files
+
+# ---------------- JOB STATE ----------------
+jobs = {}
+job_history = deque(maxlen=HISTORY_MAX)
+
+# ---------------- HELPERS ----------------
+def ytdlp_hook(d, job_id):
+    """Progress hook for yt-dlp (wrapped with job_id)."""
+    try:
+        status = d.get("status")
+        if status == "downloading":
+            jobs[job_id]["status"] = "downloading"
+            jobs[job_id]["progress"] = {
+                "percent": d.get("_percent_str", "").replace("%", ""),
+                "speed": d.get("_speed_str"),
+                "eta": d.get("eta"),
+                "stage": "downloading",
+            }
+        elif status == "finished":
+            jobs[job_id]["status"] = "processing"
+            jobs[job_id]["progress"] = {"percent": 100, "stage": "postprocessing"}
+    except Exception:
+        pass  # don’t let hook crash downloads
+
+
+def cleanup_downloads(max_files=MAX_RECENT_DOWNLOADS):
+    """Delete old files and sync job_history."""
+    try:
+        files = [
+            os.path.join(DOWNLOAD_DIR, f)
+            for f in os.listdir(DOWNLOAD_DIR)
+            if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+        ]
+        files.sort(key=os.path.getmtime, reverse=True)  # newest first
+
+        deleted_files = []
+        for f in files[max_files:]:
+            try:
+                os.remove(f)
+                deleted_files.append(os.path.basename(f))
+                print(f"[VYDRA] Deleted old file: {f}")
+            except Exception as e:
+                print(f"[VYDRA] Failed to delete {f}: {e}")
+
+        # 🔄 remove matching entries from job_history
+        if deleted_files:
+            for job in list(job_history):  # iterate copy
+                file_name = job.get("file", "").replace("/file/", "")
+                if file_name in deleted_files:
+                    job_history.remove(job)
+                    print(f"[VYDRA] Removed history for deleted file: {file_name}")
+
+    except Exception as e:
+        print(f"[VYDRA] Cleanup error: {e}")
+
+
+def run_download(job_id, url, mode, quality, enhance_video, enhance_audio):
+    try:
+        # --- build ydl_opts here ---
+        ydl_opts = {
+            "outtmpl": os.path.join(DOWNLOAD_DIR, f"{job_id}.%(ext)s"),
+            "merge_output_format": "mp4",
+            "progress_hooks": [lambda d: ytdlp_hook(d, job_id)],
+            "noplaylist": True,
+        }
+
+        # format selection
+        if quality == "720p":
+            ydl_opts["format"] = "bestvideo[height<=720]+bestaudio/best"
+        elif quality == "480p":
+            ydl_opts["format"] = "bestvideo[height<=480]+bestaudio/best"
+        elif quality == "360p":
+            ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best"
+        else:
+            ydl_opts["format"] = "bestvideo+bestaudio/best"
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            print(f"[VYDRA] Starting download job {job_id} for {url}")
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            final_file = None
+            for ext_try in ["mp4", "mkv", "webm", "mp3"]:
+                candidate = os.path.join(DOWNLOAD_DIR, f"{job_id}.{ext_try}")
+                if os.path.exists(candidate):
+                    final_file = candidate
+                    break
+
+            if not final_file:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"] = "Downloaded file not found after yt-dlp run"
+                print(f"[VYDRA] ERROR job {job_id}: final file not found.")
+                return
+
+            # extract title and tags (if available)
+            title = info.get("title") or os.path.basename(url)
+            tags = info.get("tags") or []
+            # simple hashtag generation when tags are available
+            hashtags = []
+            if tags:
+                # take up to 6 tags
+                for t in tags[:6]:
+                    hashtags.append("#" + "".join(str(t).strip().split()))
+            else:
+                # fallback: take first few words of title and make hashtags
+                words = [w for w in title.split() if len(w) > 2]
+                for w in words[:4]:
+                    hashtags.append("#" + "".join(w.strip().split()))
+
+            # update job record with full info
+            jobs[job_id].update({
+                "id": job_id,
+                "url": url,
+                "mode": mode,
+                "options": {"quality": quality, "enhance_video": enhance_video, "enhance_audio": enhance_audio},
+                "status": "finished",
+                "file": f"/file/{os.path.basename(final_file)}",
+                "history": {"title": title, "hashtags": hashtags},
+                "time": datetime.utcnow().isoformat()
+            })
+
+            # append a copy so later mutations don't affect history objects
+            job_history.appendleft(jobs[job_id].copy())
+
+            # 🔥 run cleanup
+            print("[VYDRA] Running cleanup after download...")
+            cleanup_downloads(MAX_RECENT_DOWNLOADS)
+            print("[VYDRA] Cleanup complete.")
+
+    except Exception as e:
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+        traceback.print_exc()
+
+# ---------------- ROUTES ----------------
+@app.route("/download", methods=["POST"])
+def download():
+    data = request.json
+    url = data.get("url")
+    mode = data.get("mode", "video")
+    quality = data.get("quality", "best")
+    enhance_video = data.get("enhanceVideo", False)
+    enhance_audio = data.get("enhanceAudio", False)
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "downloading"}
+
+    t = threading.Thread(
+        target=run_download,
+        args=(job_id, url, mode, quality, enhance_video, enhance_audio),
+        daemon=True
+    )
+    t.start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/progress/<job_id>")
+def progress(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "No such job"}), 404
+    return jsonify(job)
+
+
+@app.route("/cancel/<job_id>", methods=["POST"])
+def cancel(job_id):
+    if job_id not in jobs:
+        return jsonify({"error": "No such job"}), 404
+    jobs[job_id]["status"] = "cancelled"
+    return jsonify({"ok": True})
+
+
+@app.route("/file/<filename>")
+def serve_file(filename):
+    path = os.path.join(DOWNLOAD_DIR, filename)
+    if not os.path.exists(path):
+        return jsonify({"error": "File not found"}), 404
+    return send_file(path, as_attachment=True)
+
+
+@app.route("/remove_ads", methods=["POST"])
+def remove_ads():
+    data = request.json or {}
+    plan = data.get("plan", "weekly")
+    user_id = data.get("user_id", "anon")
+    purchase = {
+        "plan": plan,
+        "user_id": user_id,
+        "billed_as": f"${'1' if plan=='weekly' else '3.99'} / {plan}",
+        "time": datetime.utcnow().isoformat(),
+    }
+    return jsonify({"purchase": purchase})
+
+@app.route("/history")
+def get_history():
+    history_list = []
+    # iterate a copy so we can remove entries safely if their files are gone
+    for job in list(job_history):
+        file_rel = job.get("file")  # like "/file/abc.mp4"
+        # if there is a file link, ensure it still exists on disk
+        if file_rel:
+            filename = file_rel.replace("/file/", "")
+            path = os.path.join(DOWNLOAD_DIR, filename)
+            if not os.path.exists(path):
+                # file was removed -> remove from job_history so frontend stays clean
+                try:
+                    job_history.remove(job)
+                    print(f"[VYDRA] Removed history entry for missing file: {filename}")
+                except ValueError:
+                    pass
+                continue
+
+        history_list.append({
+            "id": job.get("id"),
+            "title": job.get("history", {}).get("title", "Unknown"),
+            "hashtags": job.get("history", {}).get("hashtags", []),
+            "file": job.get("file"),
+            "url": job.get("url"),
+            "mode": job.get("mode"),
+            "time": job.get("time"),
+            "status": job.get("status"),
+        })
+    return jsonify(history_list)
+    
+# ---------------- BACKGROUND CLEANUP ----------------
+def cleanup_worker():
+    while True:
+        try:
+            files = sorted(
+                [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
+                key=os.path.getmtime,
+            )
+
+            # if more than MAX_RECENT_DOWNLOADS, delete oldest
+            while len(files) > MAX_RECENT_DOWNLOADS:
+                oldest = files.pop(0)
+                try:
+                    os.remove(oldest)
+                    print(f"[CLEANUP] Removed old file: {oldest}")
+                except:
+                    pass
+
+            # delete files older than CLEANUP_SECONDS
+            now = time.time()
+            for f in files:
+                if now - os.path.getmtime(f) > CLEANUP_SECONDS:
+                    try:
+                        os.remove(f)
+                        print(f"[CLEANUP] Auto-deleted expired file: {f}")
+                    except:
+                        pass
+
+        except Exception as e:
+            print("[CLEANUP ERROR]", e)
+
+        time.sleep(30)  # check every 30s
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    # start cleanup worker thread only in the actual main process (avoid double start)
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
+        t_cleanup = threading.Thread(target=cleanup_worker, daemon=True)
+        t_cleanup.start()
+
+    print(f"🚀 VYDRA backend running on http://127.0.0.1:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=True)
