@@ -5,3 +5,4 @@ requests
 pillow
 gunicorn
 supabase==2.23.2
+openai==1.32.0
