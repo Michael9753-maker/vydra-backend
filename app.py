@@ -45,6 +45,21 @@ import sqlite3  # use plain sqlite3 (avoid detect_types auto-conversion pitfalls
 # Third-party clients
 from supabase import create_client, Client
 import openai
+import os
+import logging
+from flask import Flask
+
+# ===================== Fix DOWNLOAD_DIR =====================
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")  # Path for downloaded files
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)  # Create folder if it doesn't exist
+
+# ===================== Root route for testing =====================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "✅ VYDRA Backend is live and running!"
 
 # -------- Base directory (used for DB path, file storage, etc.) --------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +68,30 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("vydra-backend")
 if not log.handlers:
     logging.basicConfig(level=logging.INFO)
+
+# ===================== Cleanup function =====================
+import shutil  # for removing non-empty directories
+
+def do_cleanup_once():
+    try:
+        if not os.path.exists(DOWNLOAD_DIR):
+            logging.warning(f"DOWNLOAD_DIR '{DOWNLOAD_DIR}' does not exist. Skipping cleanup.")
+            return
+
+        for fn in os.listdir(DOWNLOAD_DIR):
+            file_path = os.path.join(DOWNLOAD_DIR, fn)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.remove(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+            except Exception as e:
+                logging.warning(f"Failed to remove '{file_path}': {e}")
+
+        logging.info("✅ Cleanup worker completed successfully.")
+
+    except Exception as e:
+        logging.error(f"Cleanup worker error: {e}")
 
 # -------- Flask app --------
 app = Flask(__name__)
@@ -75,6 +114,17 @@ missing = [name for name, val in (
 if missing:
     # This will cause Render to surface a clear error in the deploy logs
     raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+    # ===================== Schedule cleanup =====================
+from threading import Timer
+
+def schedule_cleanup():
+    do_cleanup_once()  # Run it immediately
+    # Schedule it to run every 24 hours (86400 seconds)
+    Timer(86400, schedule_cleanup).start()
+
+# Start the schedule when the app runs
+schedule_cleanup()
 
 # -------- Initialize external clients --------
 try:
