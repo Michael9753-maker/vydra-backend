@@ -57,8 +57,9 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 
 # proxy endpoints in order of preference
 _PROXY_ENDPOINTS = [
-    ("piped",       "https://pipedapi.kavin.rocks/streams/{id}"),      # primary
-    ("lemnos",      "https://yt.lemnoslife.com/streams/{id}"),        # backup
+    ("piped",       "https://pipedapi.adminforge.de/streams/{id}"),   # new primary mirror
+    ("syncpundit",  "https://pipedapi.syncpundit.com/streams/{id}"),  # secondary fallback
+    ("lemnos",      "https://yt.lemnoslife.com/streams/{id}"),        # tertiary backup
 ]
 
 def _find_stream_url_from_json(data: Any) -> Optional[str]:
