@@ -2,21 +2,16 @@
 """
 Download manager compatible with the VYDRA app adapter.
 
-Exposes:
- - get_default_manager(progress_callback=..., download_dir=..., db_path=...)
- - start_download_job(...), get_job_status(job_id), cancel_job(job_id), list_history(limit=...)
-
-Behavior highlights:
- - Asynchronous downloads using yt-dlp in worker threads
- - Progress posted to progress_callback(job_id, payload)
- - Robust final-file discovery and short polling for post-processing
- - Cleanup routine after successful/finished runs to keep N newest files and
-   remove files older than CLEANUP_SECONDS (both configurable via env)
- - Provides shutdown() to cancel running jobs and wait briefly for threads
+Behavior:
+ - Proxy-first for YouTube (Piped -> Lemnos backup)
+ - If proxy fails, automatically fall back to yt-dlp (existing logic)
+ - Streams proxy downloads to disk (no external curl dependency)
+ - Keeps the rest of your original yt-dlp-based worker and cleanup code intact
 """
 from __future__ import annotations
 
 import os
+import re
 import threading
 import uuid
 import time
@@ -24,6 +19,7 @@ import traceback
 import glob
 import logging
 import shutil
+import requests
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -50,6 +46,134 @@ MAX_RECENT_DOWNLOADS = int(os.environ.get("VYDRA_MAX_RECENT_DOWNLOADS", 5))  # k
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+# -------------------------
+# Proxy helpers (YouTube)
+# -------------------------
+_YT_VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/|youtube\.com/watch\?v=|/shorts/)([A-Za-z0-9_-]{11})")
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    m = _YT_VIDEO_ID_RE.search(url)
+    return m.group(1) if m else None
+
+# proxy endpoints in order of preference
+_PROXY_ENDPOINTS = [
+    ("piped",       "https://pipedapi.kavin.rocks/streams/{id}"),      # primary
+    ("lemnos",      "https://yt.lemnoslife.com/streams/{id}"),        # backup
+]
+
+def _find_stream_url_from_json(data: Any) -> Optional[str]:
+    """
+    Try to find a usable video URL from proxy JSON response.
+    Strategy: collect dict items that have 'url' keys, prefer those with 'mimeType' or 'ext' containing 'mp4'.
+    """
+    candidates = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            if "url" in obj and isinstance(obj["url"], str):
+                candidates.append(obj)
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    if not candidates:
+        return None
+
+    # prefer mp4 by looking at mimeType or ext keys
+    mp4_candidates = []
+    for c in candidates:
+        mt = (c.get("mimeType") or c.get("mime_type") or c.get("ext") or c.get("fileType") or "").lower()
+        if "mp4" in mt or "video" in mt:
+            mp4_candidates.append(c)
+    chosen = None
+    if mp4_candidates:
+        chosen = mp4_candidates[0]
+    else:
+        chosen = candidates[0]
+
+    return chosen.get("url")
+
+def get_youtube_proxy_stream(url: str, timeout: int = 10) -> Optional[str]:
+    """
+    Try configured proxy endpoints in order. Returns a direct stream URL (string) or None.
+    """
+    vid = _extract_youtube_id(url)
+    if not vid:
+        return None
+
+    for name, endpoint_template in _PROXY_ENDPOINTS:
+        try:
+            api_url = endpoint_template.format(id=vid)
+            log.info("[proxy] trying %s -> %s", name, api_url)
+            r = requests.get(api_url, timeout=timeout)
+            r.raise_for_status()
+            # many proxy APIs return JSON with streams/formats; parse safely
+            data = r.json()
+            stream_url = _find_stream_url_from_json(data)
+            if stream_url:
+                log.info("[proxy] %s returned stream for %s", name, vid)
+                return stream_url
+            else:
+                log.info("[proxy] %s returned JSON but no usable stream found", name)
+        except Exception as e:
+            log.warning("[proxy] %s lookup failed: %s", name, e)
+            continue
+
+    return None
+
+def _stream_url_to_file(stream_url: str, dest_path: str, job_id: str, emit_fn: callable):
+    """
+    Download a stream URL to a file using requests streaming.
+    emit_fn(job_id, payload) must exist to send progress updates.
+    """
+    try:
+        with requests.get(stream_url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            total = r.headers.get("Content-Length")
+            total = int(total) if total and total.isdigit() else None
+            downloaded = 0
+            chunk_sz = 8192
+            # write to temporary file then rename
+            temp_path = dest_path + ".part"
+            with open(temp_path, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=chunk_sz):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        percent = int((downloaded / float(total)) * 100)
+                        percent = min(100, percent)
+                    else:
+                        # approximate progress by clamping between 1..95
+                        percent = min(95, max(1, int(downloaded / 1024)))  # rough kb-based
+                    try:
+                        emit_fn(job_id, {"status": "downloading", "progress": {"percent": int(percent)}, "file_path": temp_path})
+                    except Exception:
+                        pass
+            # move to final
+            os.replace(temp_path, dest_path)
+            try:
+                emit_fn(job_id, {"status": "finished", "progress": {"percent": 100}, "file_path": dest_path, "file": f"/api/file/{os.path.basename(dest_path)}", "finished_at": _now_iso()})
+            except Exception:
+                pass
+            return True
+    except Exception as e:
+        log.exception("stream download failed for job %s: %s", job_id, e)
+        # cleanup partial if any
+        try:
+            if os.path.exists(dest_path + ".part"):
+                os.remove(dest_path + ".part")
+        except Exception:
+            pass
+        return False
+
+# -------------------------
+# DownloadManager (main)
+# -------------------------
 class DownloadManager:
     def __init__(self, progress_callback: Optional[callable] = None, download_dir: Optional[str] = None, db_path: Optional[str] = None):
         """
@@ -242,13 +366,13 @@ class DownloadManager:
     # ---- worker ----
     def _worker(self, job_id: str, url: str, opts: Dict[str, Any], cancel_ev: threading.Event):
         """
-        Worker thread to perform a download via yt-dlp and emit progress via _emit.
+        Worker thread to perform a download via proxy or yt-dlp and emit progress via _emit.
         opts: passed kwargs (mode, quality/requested_quality, user_id, is_premium, etc.)
         """
         try:
             self._emit(job_id, {"status": "starting", "progress": {"percent": 0}, "message": "Starting download"})
 
-            # prepare yt-dlp options
+            # prepare default yt-dlp options (kept for fallback)
             format_sel = "bestvideo+bestaudio/best"
             outtmpl = os.path.join(self.download_dir, f"{job_id}.%(ext)s")
             ydl_opts = {
@@ -259,8 +383,6 @@ class DownloadManager:
                 "quiet": True,
                 "no_warnings": True,
                 "progress_hooks": [self._progress_hook(job_id)],
-                # postprocessors may sometimes trigger KeyError in some yt-dlp versions when info is unexpected.
-                # We'll still request a merger, but be prepared to fallback.
                 "postprocessors": [{"key": "FFmpegMerger"}],
             }
 
@@ -270,9 +392,42 @@ class DownloadManager:
                 ydl_opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
                 ydl_opts["outtmpl"] = outtmpl
 
+            # If it's a YouTube link and user asked for video, try proxies first
+            used_proxy = False
+            final_file = None
             info = None
 
-            # Primary attempt
+            is_youtube = ("youtube.com" in url or "youtu.be" in url)
+            if is_youtube and mode != "audio":
+                stream_url = get_youtube_proxy_stream(url)
+                if stream_url:
+                    # try stream download to file
+                    dest_path = os.path.join(self.download_dir, f"{job_id}.mp4")
+                    self._emit(job_id, {"status": "downloading", "progress": {"percent": 1}, "message": "Downloading via proxy"})
+                    ok = _stream_url_to_file(stream_url, dest_path, job_id, self._emit)
+                    if ok:
+                        used_proxy = True
+                        final_file = dest_path
+                    else:
+                        log.info("Proxy download failed, falling back to yt-dlp for job %s", job_id)
+                else:
+                    log.info("No proxy stream available for job %s, using yt-dlp", job_id)
+
+            # If proxy succeeded, emit finish and cleanup
+            if used_proxy and final_file and os.path.exists(final_file):
+                webpath = f"/api/file/{os.path.basename(final_file)}"
+                self._emit(job_id, {"status": "finished", "progress": {"percent": 100}, "file_path": final_file, "file": webpath, "title": None, "finished_at": _now_iso()})
+                try:
+                    self._cleanup_old_files()
+                except Exception:
+                    log.exception("cleanup after finish failed")
+                return
+
+            # Otherwise, proceed with existing yt-dlp path (original logic)
+            if not YTDLP_AVAILABLE:
+                raise RuntimeError("yt-dlp not available and proxy download not possible")
+
+            # Primary attempt with yt-dlp
             try:
                 with YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -281,16 +436,13 @@ class DownloadManager:
                 log.exception("yt-dlp primary run failed for job %s; attempting conservative fallback", job_id)
                 try:
                     fallback_opts = dict(ydl_opts)
-                    # remove potentially-problematic postprocessor and merge flag
                     fallback_opts.pop("postprocessors", None)
                     fallback_opts.pop("merge_output_format", None)
-                    # prefer 'best' (single file) to avoid requested_formats postprocessor issues
                     fallback_opts["format"] = "best"
                     fallback_opts["progress_hooks"] = [self._progress_hook(job_id)]
                     with YoutubeDL(fallback_opts) as ydl2:
                         info = ydl2.extract_info(url, download=True)
                 except Exception as fallback_exc:
-                    # if fallback also fails, raise the original exception to be recorded below
                     log.exception("yt-dlp fallback also failed for job %s", job_id)
                     raise primary_exc
 
@@ -306,7 +458,7 @@ class DownloadManager:
                     log.exception("cleanup after finish failed")
                 return
 
-            # short polling period while postprocessing might still be running
+            # short polling for postprocessing (same as original)
             wait_secs = 15
             poll_interval = 0.8
             steps = max(1, int(wait_secs / poll_interval))
@@ -326,7 +478,7 @@ class DownloadManager:
                         log.exception("cleanup after finish failed")
                     return
 
-            # last resort: check info-dict hints
+            # final-checks (same as original)
             try:
                 possible_names: List[str] = []
                 if isinstance(info, dict):
@@ -388,7 +540,8 @@ class DownloadManager:
         url = kwargs.get("url")
         if not url:
             return None, "missing_url"
-        if not YTDLP_AVAILABLE:
+        if not YTDLP_AVAILABLE and not ("youtube.com" in url or "youtu.be" in url):
+            # if yt-dlp missing and link is non-YouTube, can't proceed
             return None, "yt-dlp-not-installed"
 
         job_id = uuid.uuid4().hex[:12]
